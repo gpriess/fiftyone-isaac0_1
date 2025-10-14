@@ -20,7 +20,9 @@ from .modular_isaac import IsaacProcessor
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DETECTION_SYSTEM_PROMPT = """You are a helpful assistant specializing visual grounding for object detection and counting.
+OPERATIONS = {
+    "detect": {
+        "prompt": """You are a helpful assistant specializing visual grounding for object detection and counting.
 
 Return each detection using this format:
 
@@ -33,12 +35,49 @@ Or for multiple instances of the same type:
   <point_box> (x1,y1) (x2,y2) </point_box>
 </collection>
 
-Detect all relevant objects and provide their labels based on the user's request.
+Detect all relevant objects and provide their labels based on the user's request.""",
+        "hint": "BOX"
+    },
+    "point": {
+        "prompt": """You are a helpful assistant specializing visual grounding for pointing at and counting objects.
 
-<hint>BOX</hint>
-"""
+Return each keypoint using this format:
 
-DEFAULT_CLASSIFICATION_SYSTEM_PROMPT = """You are a helpful assistant. You specializes in comprehensive classification across any visual domain, capable of analyzing:
+<point mention="point label"> (x,y) </point>
+
+Or for multiple instances of the same type:
+
+<collection mention="point label">
+  <point> (x1,y1) </point>
+  <point> (x2,y2) </point>
+  <point> (x3,y3) </point>
+</collection>
+
+Point to all relevant objects and provide their labels based on the user's request.""",
+        "hint": "POINT"
+    },
+    "ocr_detection": {
+        "prompt": """You are an OCR (Optical Character Recognition) system. Accurately detect, extract, and transcribe all readable text from the image.
+
+Return each text detection using this format, where "text content" is the actual text you detect:
+
+<point_box mention="text content"> (x1,y1) (x2,y2) </point_box>
+
+Detect and read the text in the image.""",
+        "hint": "BOX"
+    },
+    "ocr_polygon": {
+        "prompt": """You are an OCR (Optical Character Recognition) system. Accurately detect, extract, and transcribe all readable text from the image.
+
+Return each text detection using this format, where "text content" is the actual text you detect:
+
+<polygon mention="text content"> (x1,y1) (x2,y2) (x3,y3) (x4,y4) ... </polygon>
+
+Detect and read the text in the image.""",
+        "hint": "POLYGON"
+    },
+    "classify": {
+        "prompt": """You are a helpful assistant. You specializes in comprehensive classification across any visual domain, capable of analyzing:
 
 Unless specifically requested for single-class output, multiple relevant classifications can be provided.
 
@@ -57,30 +96,10 @@ Always return your response as valid JSON wrapped in ```json blocks.
 The JSON should contain a list of classifications where:
 - Each classification must have a 'label' field
 - Labels should be descriptive strings describing what you've identified in the image, but limited to one or two word responses
-- The response should be a list of classifications
-"""
-
-
-DEFAULT_KEYPOINT_SYSTEM_PROMPT = """You are a helpful assistant specializing visual grounding for pointing at and counting objects.
-
-Return each keypoint using this format:
-
-<point mention="point label"> (x,y) </point>
-
-Or for multiple instances of the same type:
-
-<collection mention="point label">
-  <point> (x1,y1) </point>
-  <point> (x2,y2) </point>
-  <point> (x3,y3) </point>
-</collection>
-
-Point to all relevant objects and provide their labels based on the user's request.
-
-<hint>POINT</hint>
-"""
-
-DEFAULT_POLYGON_SYSTEM_PROMPT = """You are a helpful assistant specializing visual grounding for drawing polygons around objects.
+- The response should be a list of classifications"""
+    },
+    "segment": {
+        "prompt": """You are a helpful assistant specializing visual grounding for drawing polygons around objects.
 
 Return each polygon using this format:
 
@@ -93,54 +112,22 @@ Or for multiple instances of the same type:
   <polygon> (x1,y1) (x2,y2) (x3,y3) ... </polygon>
 </collection>
 
-Draw polygons around all relevant objects and provide their labels based on the user's request.
-
-<hint>POLYGON</hint>
-"""
-
-DEFAULT_OCR_DETECTION_SYSTEM_PROMPT = """You are an OCR (Optical Character Recognition) system. Accurately detect, extract, and transcribe all readable text from the image.
-
-Return each text detection using this format, where "text content" is the actual text you detect:
-
-<point_box mention="text content"> (x1,y1) (x2,y2) </point_box>
-
-Detect and read the text in the image.
-
-<hint>BOX</hint>
-"""
-
-DEFAULT_OCR_POLYGON_SYSTEM_PROMPT = """You are an OCR (Optical Character Recognition) system. Accurately detect, extract, and transcribe all readable text from the image.
-
-Return each text detection using this format, where "text content" is the actual text you detect:
-
-<polygon mention="text content"> (x1,y1) (x2,y2) (x3,y3) (x4,y4) ... </polygon>
-
-Detect and read the text in the image.
-
-<hint>POLYGON</hint>
-"""
-
-DEFAULT_OCR_SYSTEM_PROMPT = """You are an OCR (Optical Character Recognition) system. Accurately detect, extract, and transcribe all readable text from the image. Preserve the original formatting as closely as possible, including:
+Draw polygons around all relevant objects and provide their labels based on the user's request.""",
+        "hint": "POLYGON"
+    },
+    "ocr": {
+        "prompt": """You are an OCR (Optical Character Recognition) system. Accurately detect, extract, and transcribe all readable text from the image. Preserve the original formatting as closely as possible, including:
 
 - Line breaks and paragraphs  
 - Headings and subheadings  
 - Any tables, lists, bullet points, or numbered items  
 - Special characters, spacing, and alignment  
 
-Respond with 'No Text' if there is no text in the provided image.
-"""
-
-DEFAULT_VQA_SYSTEM_PROMPT = "You are a visual question answering assistant. Provide a direct, concise answer."
-
-OPERATIONS = {
-    "detect": DEFAULT_DETECTION_SYSTEM_PROMPT,
-    "point": DEFAULT_KEYPOINT_SYSTEM_PROMPT,
-    "ocr_detection": DEFAULT_OCR_DETECTION_SYSTEM_PROMPT,
-    "ocr_polygon": DEFAULT_OCR_POLYGON_SYSTEM_PROMPT,
-    "classify": DEFAULT_CLASSIFICATION_SYSTEM_PROMPT,
-    "segment":DEFAULT_POLYGON_SYSTEM_PROMPT,
-    "ocr": DEFAULT_OCR_SYSTEM_PROMPT,
-    "vqa": DEFAULT_VQA_SYSTEM_PROMPT
+Respond with 'No Text' if there is no text in the provided image."""
+    },
+    "vqa": {
+        "prompt": "You are a visual question answering assistant. Provide a direct, concise answer."
+    }
 }
 
 def get_device():
@@ -254,7 +241,9 @@ class IsaacModel(SamplesMixin, Model):
     @property
     def system_prompt(self):
         # Return custom system prompt if set, otherwise return default for current operation
-        return self._custom_system_prompt if self._custom_system_prompt is not None else OPERATIONS[self.operation]
+        if self._custom_system_prompt is not None:
+            return self._custom_system_prompt
+        return OPERATIONS[self.operation].get("prompt", "")
 
     @system_prompt.setter
     def system_prompt(self, value):
@@ -748,13 +737,23 @@ class IsaacModel(SamplesMixin, Model):
             if field_value is not None:
                 prompt = str(field_value)  # Local variable, doesn't affect instance
 
-        # Prepare input
+        # Prepare input with optional hint
         messages = [
             {"role": "system", "content": self.system_prompt},
+        ]
+        
+        # Add hint if available for this operation
+        hint = OPERATIONS[self.operation].get("hint")
+        if hint:
+            messages.append({"role": "user", "content": f"<hint>{hint}</hint>"})
+        
+        # Add image and user prompt
+        messages.extend([
             {"role": "user", "content": "<image>"},
             {"role": "user", "content": prompt}
-        ]
-        images = [image]  # Replace with your image path
+        ])
+        
+        images = [image]
 
         # Process input
         text = self.processor.apply_chat_template(
@@ -811,12 +810,21 @@ class IsaacModel(SamplesMixin, Model):
                 if field_value is not None:
                     prompt = str(field_value)
             
-            # Prepare messages for this image
+            # Prepare messages for this image with optional hint
             messages = [
                 {"role": "system", "content": self.system_prompt},
+            ]
+            
+            # Add hint if available for this operation
+            hint = OPERATIONS[self.operation].get("hint")
+            if hint:
+                messages.append({"role": "user", "content": f"<hint>{hint}</hint>"})
+            
+            # Add image and user prompt
+            messages.extend([
                 {"role": "user", "content": "<image>"},
                 {"role": "user", "content": prompt}
-            ]
+            ])
             
             # Process input
             text = self.processor.apply_chat_template(
