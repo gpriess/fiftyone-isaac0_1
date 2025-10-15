@@ -739,18 +739,18 @@ class IsaacModel(SamplesMixin, Model):
 
         # Prepare input with optional hint
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"type": "text", "content": self.system_prompt, "role": "system"},
         ]
         
         # Add hint if available for this operation
         hint = OPERATIONS[self.operation].get("hint")
         if hint:
-            messages.append({"role": "user", "content": f"<hint>{hint}</hint>"})
+            messages.append({"type": "text", "content": f"<hint>{hint}</hint>", "role": "user"})
         
         # Add image and user prompt
         messages.extend([
-            {"role": "user", "content": "<image>"},
-            {"role": "user", "content": prompt}
+            {"type": "image", "content": "<image>", "role": "user"},
+            {"type": "text", "content": prompt, "role": "user"}
         ])
         
         images = [image]
