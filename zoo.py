@@ -1,4 +1,3 @@
-
 import os
 import logging
 import json
@@ -13,7 +12,6 @@ import fiftyone as fo
 from fiftyone import Model, SamplesMixin
 
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-
 from transformers.utils.import_utils import is_flash_attn_2_available
 
 from .modular_isaac import IsaacProcessor
@@ -151,7 +149,7 @@ class IsaacModel(SamplesMixin, Model):
         self._fields = {}
         
         self.model_path = model_path
-        self._custom_system_prompt = system_prompt  # Store custom system prompt if provided
+        self._custom_system_prompt = system_prompt
         self._operation = operation
         self.prompt = prompt
         
@@ -227,7 +225,6 @@ class IsaacModel(SamplesMixin, Model):
         """Enable handling of varying image sizes in batches."""
         return True
     
-
     @property
     def operation(self):
         return self._operation
@@ -249,18 +246,41 @@ class IsaacModel(SamplesMixin, Model):
     def system_prompt(self, value):
         self._custom_system_prompt = value
 
-
     def _strip_think_blocks(self, text: str) -> str:
         """Remove <think>...</think> blocks from text."""
         return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     def _parse_coordinates(self, coord_str: str) -> Optional[List[float]]:
-        """Extract coordinates from various formats like (x,y) or (x1,y1) (x2,y2)."""
-        # Find all numbers (int or float) in the string
-        numbers = re.findall(r'-?\d+(?:\.\d+)?', coord_str)
-        if numbers:
-            return [float(n) for n in numbers]
-        return None
+        """Extract coordinates from parentheses-enclosed tuples.
+        
+        Matches patterns like (x,y) or (x, y) with optional whitespace.
+        Ensures we only extract numbers that are actually coordinate pairs,
+        not stray numbers in the text.
+        
+        Args:
+            coord_str: String containing coordinate pairs in format (x,y)
+            
+        Returns:
+            List of floats representing coordinates, or None if no valid coords found
+            
+        Examples:
+            "(100, 200)" -> [100.0, 200.0]
+            "(0,0) (100,100)" -> [0.0, 0.0, 100.0, 100.0]
+            "Found 2 objects at (50, 75)" -> [50.0, 75.0]  # Ignores "2"
+        """
+        # Match coordinate pairs in parentheses with optional whitespace
+        coord_pattern = r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)'
+        matches = re.findall(coord_pattern, coord_str)
+        
+        if not matches:
+            return None
+        
+        # Flatten list of tuples into single list of floats
+        coords = []
+        for pair in matches:
+            coords.extend([float(pair[0]), float(pair[1])])
+        
+        return coords
 
     def _extract_point_boxes(self, text: str) -> List[Dict]:
         """Extract all <point_box> elements from text."""
@@ -269,15 +289,23 @@ class IsaacModel(SamplesMixin, Model):
         # Pattern for point_box with optional mention attribute
         pattern = r'<point_box(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</point_box>'
         
-        for match in re.finditer(pattern, text, re.DOTALL):
-            mention = match.group(1)  # May be None
+        unlabeled_count = 0
+        for match in re.finditer(pattern, text, flags=re.DOTALL):
+            mention = match.group(1)
             coords_text = match.group(2)
             
             coords = self._parse_coordinates(coords_text)
             if coords and len(coords) >= 4:
+                # Generate unique label for unlabeled detections
+                if mention:
+                    label = mention
+                else:
+                    unlabeled_count += 1
+                    label = f'object_{unlabeled_count}'
+                
                 boxes.append({
-                    'bbox_2d': coords[:4],  # Take first 4 numbers
-                    'label': mention or 'object'
+                    'bbox_2d': coords[:4],
+                    'label': label
                 })
         
         return boxes
@@ -289,15 +317,23 @@ class IsaacModel(SamplesMixin, Model):
         # Pattern for point with optional mention attribute
         pattern = r'<point(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</point>'
         
-        for match in re.finditer(pattern, text, re.DOTALL):
-            mention = match.group(1)  # May be None
+        unlabeled_count = 0
+        for match in re.finditer(pattern, text, flags=re.DOTALL):
+            mention = match.group(1)
             coords_text = match.group(2)
             
             coords = self._parse_coordinates(coords_text)
             if coords and len(coords) >= 2:
+                # Generate unique label for unlabeled points
+                if mention:
+                    label = mention
+                else:
+                    unlabeled_count += 1
+                    label = f'point_{unlabeled_count}'
+                
                 points.append({
-                    'point_2d': coords[:2],  # Take first 2 numbers
-                    'label': mention or 'point'
+                    'point_2d': coords[:2],
+                    'label': label
                 })
         
         return points
@@ -309,21 +345,45 @@ class IsaacModel(SamplesMixin, Model):
         # Pattern for polygon with optional mention attribute
         pattern = r'<polygon(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</polygon>'
         
-        for match in re.finditer(pattern, text, re.DOTALL):
-            mention = match.group(1)  # May be None
+        unlabeled_count = 0
+        for match in re.finditer(pattern, text, flags=re.DOTALL):
+            mention = match.group(1)
             coords_text = match.group(2)
             
             coords = self._parse_coordinates(coords_text)
-            if coords and len(coords) >= 6:  # At least 3 points (6 numbers)
-                # Group coordinates into pairs
-                vertices = []
-                for i in range(0, len(coords) - 1, 2):
-                    vertices.append([coords[i], coords[i + 1]])
+            if not coords:
+                logger.debug(f"No coordinates found in polygon: {coords_text[:100]}")
+                continue
                 
-                polygons.append({
-                    'vertices': vertices,
-                    'label': mention or 'polygon'
-                })
+            # Polygons need at least 3 points (6 numbers)
+            if len(coords) < 6:
+                logger.debug(f"Insufficient coordinates for polygon (need >=6, got {len(coords)}): {coords}")
+                continue
+            
+            # Check for odd number of coordinates and fix
+            if len(coords) % 2 != 0:
+                logger.warning(f"Odd number of coordinates in polygon ({len(coords)}), dropping last value")
+                coords = coords[:-1]
+            
+            # Group coordinates into vertex pairs
+            vertices = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
+            
+            # Final validation: ensure we have at least 3 vertices
+            if len(vertices) < 3:
+                logger.debug(f"Insufficient vertices for polygon (need >=3, got {len(vertices)})")
+                continue
+            
+            # Generate unique label for unlabeled polygons
+            if mention:
+                label = mention
+            else:
+                unlabeled_count += 1
+                label = f'polygon_{unlabeled_count}'
+            
+            polygons.append({
+                'vertices': vertices,
+                'label': label
+            })
         
         return polygons
 
@@ -335,7 +395,7 @@ class IsaacModel(SamplesMixin, Model):
         collection_pattern = r'<collection(?:\s+mention="([^"]*)")?\s*>(.*?)</collection>'
         
         # First, process collections
-        for match in re.finditer(collection_pattern, text, re.DOTALL):
+        for match in re.finditer(collection_pattern, text, flags=re.DOTALL):
             collection_mention = match.group(1)
             collection_content = match.group(2)
             
@@ -343,24 +403,24 @@ class IsaacModel(SamplesMixin, Model):
             if element_type == 'point_box' or element_type is None:
                 boxes = self._extract_point_boxes(collection_content)
                 for box in boxes:
-                    # Inherit collection mention if box doesn't have one
-                    if box['label'] == 'object' and collection_mention:
+                    # Inherit collection mention if box has default label
+                    if box['label'].startswith('object_') and collection_mention:
                         box['label'] = collection_mention
                     all_elements.append({'bbox_2d': box['bbox_2d'], 'label': box['label']})
             
             if element_type == 'point' or element_type is None:
                 points = self._extract_points(collection_content)
                 for point in points:
-                    # Inherit collection mention if point doesn't have one
-                    if point['label'] == 'point' and collection_mention:
+                    # Inherit collection mention if point has default label
+                    if point['label'].startswith('point_') and collection_mention:
                         point['label'] = collection_mention
                     all_elements.append({'point_2d': point['point_2d'], 'label': point['label']})
             
             if element_type == 'polygon' or element_type is None:
                 polygons = self._extract_polygons(collection_content)
                 for polygon in polygons:
-                    # Inherit collection mention if polygon doesn't have one
-                    if polygon['label'] == 'polygon' and collection_mention:
+                    # Inherit collection mention if polygon has default label
+                    if polygon['label'].startswith('polygon_') and collection_mention:
                         polygon['label'] = collection_mention
                     all_elements.append({'vertices': polygon['vertices'], 'label': polygon['label']})
         
@@ -376,6 +436,136 @@ class IsaacModel(SamplesMixin, Model):
             all_elements.extend(self._extract_polygons(text_without_collections))
         
         return all_elements
+
+    def _validate_and_fix_json_structure(self, parsed_json: Dict) -> Dict:
+        """Validate and fix JSON structure from model output.
+        
+        Ensures the parsed JSON has all required keys with properly formatted values.
+        Also validates the structure of nested elements.
+        
+        Args:
+            parsed_json: Dictionary parsed from model JSON output
+            
+        Returns:
+            Validated and fixed dictionary with all required keys and valid structure
+        """
+        # Ensure all expected keys exist as lists
+        required_keys = ['detections', 'keypoints', 'polygons', 'classifications', 
+                         'text_detections', 'text_polygons']
+        
+        for key in required_keys:
+            if key not in parsed_json:
+                parsed_json[key] = []
+            elif not isinstance(parsed_json[key], list):
+                logger.warning(f"Expected list for '{key}', got {type(parsed_json[key])}. Converting to empty list.")
+                parsed_json[key] = []
+        
+        # Validate detections structure
+        validated_detections = []
+        for det in parsed_json.get('detections', []):
+            if not isinstance(det, dict):
+                logger.warning(f"Invalid detection format (not a dict): {det}")
+                continue
+            
+            # Check for required bbox field (accept either bbox or bbox_2d)
+            if 'bbox' in det or 'bbox_2d' in det:
+                bbox = det.get('bbox', det.get('bbox_2d'))
+                # Validate bbox is a list of 4 numbers
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    try:
+                        # Ensure all bbox values are numeric
+                        _ = [float(x) for x in bbox]
+                        validated_detections.append(det)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid bbox coordinates (not numeric): {bbox}")
+                else:
+                    logger.warning(f"Invalid bbox format (need 4 numbers): {bbox}")
+            else:
+                logger.warning(f"Detection missing bbox field: {det}")
+        
+        parsed_json['detections'] = validated_detections
+        parsed_json['text_detections'] = validated_detections.copy()
+        
+        # Validate keypoints structure
+        validated_keypoints = []
+        for kp in parsed_json.get('keypoints', []):
+            if not isinstance(kp, dict):
+                logger.warning(f"Invalid keypoint format (not a dict): {kp}")
+                continue
+            
+            # Check for required point field
+            if 'point_2d' in kp or 'point' in kp:
+                point = kp.get('point_2d', kp.get('point'))
+                # Validate point is a list of 2 numbers
+                if isinstance(point, list) and len(point) == 2:
+                    try:
+                        _ = [float(x) for x in point]
+                        validated_keypoints.append(kp)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid point coordinates (not numeric): {point}")
+                else:
+                    logger.warning(f"Invalid point format (need 2 numbers): {point}")
+            else:
+                logger.warning(f"Keypoint missing point field: {kp}")
+        
+        parsed_json['keypoints'] = validated_keypoints
+        
+        # Validate polygons structure
+        validated_polygons = []
+        for poly in parsed_json.get('polygons', []):
+            if not isinstance(poly, dict):
+                logger.warning(f"Invalid polygon format (not a dict): {poly}")
+                continue
+            
+            # Check for required vertices field
+            if 'vertices' in poly:
+                vertices = poly['vertices']
+                # Validate vertices is a list of coordinate pairs
+                if isinstance(vertices, list) and len(vertices) >= 3:
+                    try:
+                        # Ensure all vertices are valid coordinate pairs
+                        valid_vertices = True
+                        for vertex in vertices:
+                            if not isinstance(vertex, list) or len(vertex) != 2:
+                                valid_vertices = False
+                                break
+                            _ = [float(x) for x in vertex]
+                        
+                        if valid_vertices:
+                            validated_polygons.append(poly)
+                        else:
+                            logger.warning(f"Invalid vertex format in polygon: {vertices}")
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid polygon coordinates (not numeric): {vertices}")
+                else:
+                    logger.warning(f"Invalid polygon format (need >=3 vertices): {vertices}")
+            else:
+                logger.warning(f"Polygon missing vertices field: {poly}")
+        
+        parsed_json['polygons'] = validated_polygons
+        parsed_json['text_polygons'] = validated_polygons.copy()
+        
+        # Validate classifications structure
+        validated_classifications = []
+        for cls in parsed_json.get('classifications', []):
+            if not isinstance(cls, dict):
+                logger.warning(f"Invalid classification format (not a dict): {cls}")
+                continue
+            
+            # Check for required label field
+            if 'label' in cls:
+                # Ensure label is a string
+                if isinstance(cls['label'], str) or isinstance(cls['label'], (int, float)):
+                    cls['label'] = str(cls['label'])
+                    validated_classifications.append(cls)
+                else:
+                    logger.warning(f"Invalid label type: {type(cls['label'])}")
+            else:
+                logger.warning(f"Classification missing label field: {cls}")
+        
+        parsed_json['classifications'] = validated_classifications
+        
+        return parsed_json
 
     def _parse_model_output(self, output_text: str) -> Dict:
         """
@@ -407,15 +597,11 @@ class IsaacModel(SamplesMixin, Model):
             for elem in all_elements:
                 if 'bbox_2d' in elem:
                     result['detections'].append(elem)
-                    # Also add to text_detections for OCR operations
-                    # Using 'label' consistently instead of 'text' field
                     result['text_detections'].append(elem)
                 elif 'point_2d' in elem:
                     result['keypoints'].append(elem)
                 elif 'vertices' in elem:
                     result['polygons'].append(elem)
-                    # Also add to text_polygons for OCR polygon operations
-                    # Using 'label' consistently for the detected text
                     result['text_polygons'].append(elem)
             
             return result
@@ -426,23 +612,22 @@ class IsaacModel(SamplesMixin, Model):
             # Handle JSON wrapped in markdown code blocks
             if "```json" in json_text:
                 try:
-                    # Extract JSON between ```json and ``` markers
                     json_text = json_text.split("```json")[1].split("```")[0].strip()
-                except:
-                    pass
+                except IndexError:
+                    logger.debug("Failed to extract JSON from code block markers")
             
             # Attempt to parse the JSON string
             try:
                 parsed_json = json.loads(json_text)
-                # Ensure all expected keys exist
                 if isinstance(parsed_json, dict):
-                    for key in ['detections', 'keypoints', 'polygons', 'classifications', 'text_detections', 'text_polygons']:
-                        if key not in parsed_json:
-                            parsed_json[key] = []
-                    return parsed_json
-            except:
-                # Log first 200 chars of failed parse for debugging
-                logger.debug(f"Failed to parse as JSON: {json_text[:200]}")
+                    # Validate and fix the structure
+                    return self._validate_and_fix_json_structure(parsed_json)
+                else:
+                    logger.warning(f"Parsed JSON is not a dict: {type(parsed_json)}")
+            except json.JSONDecodeError as e:
+                logger.debug(f"Failed to parse as JSON: {e}. Text: {json_text[:200]}")
+            except Exception as e:
+                logger.warning(f"Unexpected error parsing JSON: {e}")
             
             # If both fail, return empty structure
             logger.debug(f"Could not parse output in any known format: {cleaned_text[:200]}")
@@ -455,7 +640,7 @@ class IsaacModel(SamplesMixin, Model):
                 'text_polygons': []
             }
 
-    def _to_detections(self, boxes: List[Dict]) -> fo.Detections:
+    def _to_detections(self, boxes: List[Dict], is_ocr: bool = False) -> fo.Detections:
         """Convert bounding boxes to FiftyOne Detections.
         
         This method handles both regular object detections and OCR text detections.
@@ -463,12 +648,12 @@ class IsaacModel(SamplesMixin, Model):
         Args:
             boxes: List of dictionaries containing bounding box info.
                 Each box should have:
-                - 'bbox_2d' or 'bbox': List of [x1,y1,x2,y2] coordinates in 0-1000 range from model
-                - 'label': String label (defaults to "object"). For OCR detections, this contains the detected text.
-
+                - 'bbox_2d' or 'bbox': List of [x1,y1,x2,y2] coordinates in 0-1000 range
+                - 'label': String label. For OCR detections, this contains the detected text.
+            is_ocr: If True, treats label as OCR text and adds it as a custom attribute
+        
         Returns:
-            fo.Detections object containing the converted bounding box annotations
-            with coordinates normalized to [0,1] x [0,1] range
+            fo.Detections object with normalized coordinates [0,1] x [0,1]
         """
         if not boxes:
             return fo.Detections(detections=[])
@@ -484,28 +669,30 @@ class IsaacModel(SamplesMixin, Model):
                     
                 # Model outputs coordinates in 0-1000 range, normalize to 0-1
                 x1, y1, x2, y2 = map(float, bbox)
-                x = x1 / 1000.0  # Normalized left x
-                y = y1 / 1000.0  # Normalized top y
-                w = (x2 - x1) / 1000.0  # Normalized width
-                h = (y2 - y1) / 1000.0  # Normalized height
+                x = x1 / 1000.0
+                y = y1 / 1000.0
+                w = (x2 - x1) / 1000.0
+                h = (y2 - y1) / 1000.0
+                
+                label = str(box.get("label", "object"))
                 
                 # Create Detection object with normalized coordinates
-                try:
-                    detection = fo.Detection(
-                        label=str(box.get("label", "object")),
-                        bounding_box=[x, y, w, h],
-                    )
-                    detections.append(detection)
-                except:
-                    continue
+                detection = fo.Detection(
+                    label=label,
+                    bounding_box=[x, y, w, h],
+                )
+                
+                # For OCR mode, also store the text in a dedicated attribute
+                if is_ocr:
+                    detection["text"] = label
+                
+                detections.append(detection)
                 
             except Exception as e:
-                # Log any errors processing individual boxes but continue
                 logger.debug(f"Error processing box {box}: {e}")
                 continue
                 
         return fo.Detections(detections=detections)
-
 
     def _to_keypoints(self, points: List[Dict]) -> fo.Keypoints:
         """Convert a list of point dictionaries to FiftyOne Keypoints.
@@ -513,12 +700,11 @@ class IsaacModel(SamplesMixin, Model):
         Args:
             points: List of dictionaries containing point information.
                 Each point should have:
-                - 'point_2d': List of [x,y] coordinates in 0-1000 range from model
+                - 'point_2d': List of [x,y] coordinates in 0-1000 range
                 - 'label': String label describing the point
                 
         Returns:
-            fo.Keypoints object containing the converted keypoint annotations
-            with coordinates normalized to [0,1] x [0,1] range
+            fo.Keypoints object with normalized coordinates [0,1] x [0,1]
         """
         if not points:
             return fo.Keypoints(keypoints=[])
@@ -549,7 +735,7 @@ class IsaacModel(SamplesMixin, Model):
                 
         return fo.Keypoints(keypoints=keypoints)
 
-    def _to_polygons(self, polygons: List[Dict]) -> fo.Polylines:
+    def _to_polygons(self, polygons: List[Dict], is_ocr: bool = False) -> fo.Polylines:
         """Convert polygon data to FiftyOne Polylines.
         
         This method handles both regular polygon segmentations and OCR text polygons.
@@ -558,7 +744,8 @@ class IsaacModel(SamplesMixin, Model):
             polygons: List of dictionaries containing polygon information.
                 Each dictionary should have:
                 - 'vertices': List of [x,y] coordinate pairs in 0-1000 range
-                - 'label': String label describing the polygon. For OCR polygons, this contains the detected text.
+                - 'label': String label. For OCR polygons, this contains the detected text.
+            is_ocr: If True, treats label as OCR text and adds it as a custom attribute
                 
         Returns:
             fo.Polylines object containing the polygon annotations
@@ -581,14 +768,20 @@ class IsaacModel(SamplesMixin, Model):
                     norm_y = float(y) / 1000.0
                     normalized_points.append([norm_x, norm_y])
                 
-                # Create a Polyline - points should be a list of shapes, 
-                # where each shape is a list of [x,y] points
+                label = str(polygon.get('label', 'polygon'))
+                
+                # Create Polyline
                 polyline = fo.Polyline(
-                    label=str(polygon.get('label', 'polygon')),
-                    points=[normalized_points],  # Wrap in list since it's one polygon
-                    closed=True,  # Polygons are closed shapes
-                    filled=True   # Can be used as segmentation masks
+                    label=label,
+                    points=[normalized_points],
+                    closed=True,
+                    filled=True
                 )
+                
+                # For OCR mode, also store the text in a dedicated attribute
+                if is_ocr:
+                    polyline["text"] = label
+                
                 polylines.append(polyline)
                 
             except Exception as e:
@@ -606,60 +799,47 @@ class IsaacModel(SamplesMixin, Model):
                 - 'label': String class label
                 
         Returns:
-            fo.Classifications object containing the converted classification 
-            annotations with labels
+            fo.Classifications object containing the classification annotations
         """
         if not classes:
             return fo.Classifications(classifications=[])
             
         classifications = []
         
-        # Process each classification dictionary
         for cls in classes:
             try:
-                # Create Classification object with required label and optional confidence
                 classification = fo.Classification(
-                    label=str(cls["label"]),  # Convert label to string for consistency
+                    label=str(cls["label"]),
                 )
                 classifications.append(classification)
             except Exception as e:
-                # Log any errors but continue processing remaining classifications
                 logger.debug(f"Error processing classification {cls}: {e}")
                 continue
                 
-        # Return Classifications container with all processed results
         return fo.Classifications(classifications=classifications)
-
 
     def _process_output(self, output_text: str, image: Image.Image):
         """Process model output text based on the current operation type.
         
         Args:
             output_text: Raw text output from the model
-            image: PIL Image that was processed (needed for size information)
+            image: PIL Image that was processed
             
         Returns:
-            Processed output in the appropriate format for the operation:
-            - str for vqa and ocr operations
-            - fo.Detections for detect and ocr_detection operations
-            - fo.Keypoints for point operations
-            - fo.Classifications for classify operations
-            - None if operation is not recognized
+            Processed output in the appropriate format for the operation
         """
         if self.operation == "vqa":
-            # VQA returns plain text after stripping think blocks
             cleaned = self._strip_think_blocks(output_text)
             return cleaned.strip()
         
         elif self.operation == "ocr":
-            # OCR returns plain text after stripping think blocks
             cleaned = self._strip_think_blocks(output_text)
             return cleaned.strip()
         
         elif self.operation == "detect":
             parsed = self._parse_model_output(output_text)
             data = parsed.get('detections', [])
-            return self._to_detections(data)
+            return self._to_detections(data, is_ocr=False)
         
         elif self.operation == "point":
             parsed = self._parse_model_output(output_text)
@@ -681,28 +861,24 @@ class IsaacModel(SamplesMixin, Model):
             return self._to_keypoints(data)
         
         elif self.operation == "classify":
-            # Classifications might still come as JSON
             parsed = self._parse_model_output(output_text)
             data = parsed.get('classifications', [])
             return self._to_classifications(data)
         
         elif self.operation == "ocr_detection":
             parsed = self._parse_model_output(output_text)
-            # For OCR detection, the text is stored in the label field
             data = parsed.get('text_detections', [])
-            return self._to_detections(data)
+            return self._to_detections(data, is_ocr=True)
         
         elif self.operation == "ocr_polygon":
             parsed = self._parse_model_output(output_text)
-            # For OCR polygon detection, the text is stored in the label field
             data = parsed.get('text_polygons', [])
-            return self._to_polygons(data)
+            return self._to_polygons(data, is_ocr=True)
         
         elif self.operation == "polygon" or self.operation == "segment":
-            # Add polygon/segmentation operation support
             parsed = self._parse_model_output(output_text)
             data = parsed.get('polygons', [])
-            return self._to_polygons(data)
+            return self._to_polygons(data, is_ocr=False)
         
         else:
             return None
@@ -710,32 +886,20 @@ class IsaacModel(SamplesMixin, Model):
     def _predict(self, image: Image.Image, sample=None) -> Union[fo.Detections, fo.Keypoints, fo.Classifications, str]:
         """Process a single image through the model and return predictions.
         
-        This internal method handles the core prediction logic including:
-        - Constructing the chat messages with system prompt and user query
-        - Processing the image and text through the model
-        - Parsing the output based on the operation type (detection/points/classification/VQA)
-        
         Args:
             image: PIL Image to process
             sample: Optional FiftyOne sample containing the image filepath
             
         Returns:
-            One of:
-            - fo.Detections: For object detection results
-            - fo.Keypoints: For keypoint detection results  
-            - fo.Classifications: For classification results
-            - str: For VQA text responses
-            
-        Raises:
-            ValueError: If no prompt has been set
+            Model predictions in the appropriate format for the current operation
         """
         # Use local prompt variable instead of modifying self.prompt
-        prompt = self.prompt  # Start with instance default
+        prompt = self.prompt
         
         if sample is not None and self._get_field() is not None:
             field_value = sample.get_field(self._get_field())
             if field_value is not None:
-                prompt = str(field_value)  # Local variable, doesn't affect instance
+                prompt = str(field_value)
 
         # Prepare input with optional hint
         messages = [
@@ -803,7 +967,7 @@ class IsaacModel(SamplesMixin, Model):
             sample = samples[i] if samples and i < len(samples) else None
             
             # Get prompt for this specific image/sample
-            prompt = self.prompt  # Start with instance default
+            prompt = self.prompt
             
             if sample is not None and self._get_field() is not None:
                 field_value = sample.get_field(self._get_field())
@@ -861,9 +1025,6 @@ class IsaacModel(SamplesMixin, Model):
     def predict_all(self, args):
         """Efficient batch prediction for multiple images.
         
-        This method enables batch processing of multiple images for improved
-        performance when processing datasets.
-        
         Args:
             args: List of tuples where each tuple contains (image, sample) or just images
             
@@ -896,9 +1057,6 @@ class IsaacModel(SamplesMixin, Model):
 
     def predict(self, image, sample=None):
         """Process an image with the model.
-        
-        A convenience wrapper around _predict that handles numpy array inputs
-        by converting them to PIL Images first.
         
         Args:
             image: PIL Image or numpy array to process
