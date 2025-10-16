@@ -251,36 +251,24 @@ class IsaacModel(SamplesMixin, Model):
         return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     def _parse_coordinates(self, coord_str: str) -> Optional[List[float]]:
-        """Extract coordinates from parentheses-enclosed tuples.
-        
-        Matches patterns like (x,y) or (x, y) with optional whitespace.
-        Ensures we only extract numbers that are actually coordinate pairs,
-        not stray numbers in the text.
+        """Extract coordinates using parentheses pattern, falling back to all numbers.
         
         Args:
-            coord_str: String containing coordinate pairs in format (x,y)
+            coord_str: String containing coordinate pairs
             
         Returns:
-            List of floats representing coordinates, or None if no valid coords found
-            
-        Examples:
-            "(100, 200)" -> [100.0, 200.0]
-            "(0,0) (100,100)" -> [0.0, 0.0, 100.0, 100.0]
-            "Found 2 objects at (50, 75)" -> [50.0, 75.0]  # Ignores "2"
+            List of floats, or None if no valid coordinates found
         """
-        # Match coordinate pairs in parentheses with optional whitespace
+        # Try parentheses format: (x,y)
         coord_pattern = r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)'
         matches = re.findall(coord_pattern, coord_str)
         
-        if not matches:
-            return None
+        if matches:
+            return [float(val) for pair in matches for val in pair]
         
-        # Flatten list of tuples into single list of floats
-        coords = []
-        for pair in matches:
-            coords.extend([float(pair[0]), float(pair[1])])
-        
-        return coords
+        # Fallback: extract all numbers
+        numbers = re.findall(r'-?\d+(?:\.\d+)?', coord_str)
+        return [float(n) for n in numbers] if len(numbers) >= 2 else None
 
     def _extract_point_boxes(self, text: str) -> List[Dict]:
         """Extract all <point_box> elements from text."""
@@ -339,50 +327,31 @@ class IsaacModel(SamplesMixin, Model):
         return points
 
     def _extract_polygons(self, text: str) -> List[Dict]:
-        """Extract all <polygon> elements from text."""
-        polygons = []
-        
-        # Pattern for polygon with optional mention attribute
+        """Extract all <polygon> elements from text. Parse everything, drop nothing."""
         pattern = r'<polygon(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</polygon>'
-        
+        polygons = []
         unlabeled_count = 0
+        
         for match in re.finditer(pattern, text, flags=re.DOTALL):
-            mention = match.group(1)
-            coords_text = match.group(2)
-            
+            mention, coords_text = match.groups()
             coords = self._parse_coordinates(coords_text)
+            
             if not coords:
-                logger.debug(f"No coordinates found in polygon: {coords_text[:100]}")
-                continue
-                
-            # Polygons need at least 3 points (6 numbers)
-            if len(coords) < 6:
-                logger.debug(f"Insufficient coordinates for polygon (need >=6, got {len(coords)}): {coords}")
+                logger.info(f"Polygon '{mention or 'unlabeled'}': no coordinates found in: {coords_text[:80]}")
                 continue
             
-            # Check for odd number of coordinates and fix
+            # Handle odd coordinates by dropping last one
             if len(coords) % 2 != 0:
-                logger.warning(f"Odd number of coordinates in polygon ({len(coords)}), dropping last value")
+                logger.info(f"Polygon '{mention or 'unlabeled'}': odd coords ({len(coords)}), dropping last")
                 coords = coords[:-1]
             
-            # Group coordinates into vertex pairs
+            # Convert to vertices - accept ANY number of vertices (even 1 or 2)
             vertices = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
             
-            # Final validation: ensure we have at least 3 vertices
-            if len(vertices) < 3:
-                logger.debug(f"Insufficient vertices for polygon (need >=3, got {len(vertices)})")
-                continue
-            
-            # Generate unique label for unlabeled polygons
-            if mention:
-                label = mention
-            else:
-                unlabeled_count += 1
-                label = f'polygon_{unlabeled_count}'
-            
+            unlabeled_count += 1
             polygons.append({
                 'vertices': vertices,
-                'label': label
+                'label': mention or f'polygon_{unlabeled_count}'
             })
         
         return polygons
@@ -510,37 +479,26 @@ class IsaacModel(SamplesMixin, Model):
         
         parsed_json['keypoints'] = validated_keypoints
         
-        # Validate polygons structure
+        # Validate polygons structure - accept all valid coordinate pairs
         validated_polygons = []
         for poly in parsed_json.get('polygons', []):
-            if not isinstance(poly, dict):
-                logger.warning(f"Invalid polygon format (not a dict): {poly}")
+            if not isinstance(poly, dict) or 'vertices' not in poly:
                 continue
             
-            # Check for required vertices field
-            if 'vertices' in poly:
-                vertices = poly['vertices']
-                # Validate vertices is a list of coordinate pairs
-                if isinstance(vertices, list) and len(vertices) >= 3:
-                    try:
-                        # Ensure all vertices are valid coordinate pairs
-                        valid_vertices = True
-                        for vertex in vertices:
-                            if not isinstance(vertex, list) or len(vertex) != 2:
-                                valid_vertices = False
-                                break
-                            _ = [float(x) for x in vertex]
-                        
-                        if valid_vertices:
-                            validated_polygons.append(poly)
-                        else:
-                            logger.warning(f"Invalid vertex format in polygon: {vertices}")
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid polygon coordinates (not numeric): {vertices}")
+            vertices = poly['vertices']
+            if not isinstance(vertices, list):
+                logger.info(f"Polygon vertices is not a list: {type(vertices)}")
+                continue
+            
+            # Validate vertices are coordinate pairs, but accept ANY number (even 1 or 2)
+            try:
+                if all(isinstance(v, list) and len(v) == 2 for v in vertices):
+                    _ = [[float(x) for x in v] for v in vertices]  # Ensure numeric
+                    validated_polygons.append(poly)
                 else:
-                    logger.warning(f"Invalid polygon format (need >=3 vertices): {vertices}")
-            else:
-                logger.warning(f"Polygon missing vertices field: {poly}")
+                    logger.info(f"Polygon has invalid vertex format")
+            except (ValueError, TypeError):
+                logger.info(f"Polygon has non-numeric coordinates")
         
         parsed_json['polygons'] = validated_polygons
         parsed_json['text_polygons'] = validated_polygons.copy()
@@ -567,78 +525,69 @@ class IsaacModel(SamplesMixin, Model):
         
         return parsed_json
 
+    def _parse_xml_output(self, text: str) -> Dict:
+        """Parse XML-like output format."""
+        result = {
+            'detections': [],
+            'keypoints': [],
+            'polygons': [],
+            'text_detections': [],
+            'text_polygons': [],
+            'classifications': []
+        }
+        
+        all_elements = self._extract_all_elements(text)
+        
+        for elem in all_elements:
+            if 'bbox_2d' in elem:
+                result['detections'].append(elem)
+                result['text_detections'].append(elem)
+            elif 'point_2d' in elem:
+                result['keypoints'].append(elem)
+            elif 'vertices' in elem:
+                result['polygons'].append(elem)
+                result['text_polygons'].append(elem)
+        
+        logger.info(f"XML: {len(result['polygons'])} polygons, {len(result['detections'])} detections, {len(result['keypoints'])} keypoints")
+        return result
+
+    def _parse_json_output(self, text: str) -> Dict:
+        """Parse JSON output format."""
+        # Extract JSON from markdown if needed
+        if "```json" in text:
+            try:
+                text = text.split("```json")[1].split("```")[0].strip()
+            except IndexError:
+                logger.warning("Failed to extract JSON from code block")
+        
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                validated = self._validate_and_fix_json_structure(parsed)
+                logger.info(f"JSON: {len(validated.get('polygons', []))} polygons, {len(validated.get('detections', []))} detections")
+                return validated
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON parse error: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error: {e}")
+        
+        # Return empty structure if parsing fails
+        return {
+            'detections': [], 'keypoints': [], 'polygons': [],
+            'classifications': [], 'text_detections': [], 'text_polygons': []
+        }
+
     def _parse_model_output(self, output_text: str) -> Dict:
-        """
-        Unified parser that handles both XML-like and JSON formats.
-        Returns a standardized dictionary structure regardless of input format.
-        """
-        # Step 1: Clean the output
+        """Parse model output (XML or JSON format) into standardized structure."""
         cleaned_text = self._strip_think_blocks(output_text)
         
-        # Step 2: Detect format and parse accordingly
-        # Check if it's XML-like format
+        # Log raw output for debugging
+        logger.info(f"Model output: {cleaned_text[:500]}{'...' if len(cleaned_text) > 500 else ''}")
+        
+        # Detect and parse format
         has_xml_tags = any(tag in cleaned_text for tag in ['<point>', '<point_box>', '<polygon>', '<collection>'])
         
-        if has_xml_tags:
-            # Parse XML-like format
-            result = {
-                'detections': [],
-                'keypoints': [],
-                'polygons': [],
-                'text_detections': [],
-                'text_polygons': [],
-                'classifications': []
-            }
-            
-            # Extract all elements (both from collections and standalone)
-            all_elements = self._extract_all_elements(cleaned_text)
-            
-            # Sort elements into appropriate categories
-            for elem in all_elements:
-                if 'bbox_2d' in elem:
-                    result['detections'].append(elem)
-                    result['text_detections'].append(elem)
-                elif 'point_2d' in elem:
-                    result['keypoints'].append(elem)
-                elif 'vertices' in elem:
-                    result['polygons'].append(elem)
-                    result['text_polygons'].append(elem)
-            
-            return result
-        else:
-            # Try JSON format parsing
-            json_text = cleaned_text
-            
-            # Handle JSON wrapped in markdown code blocks
-            if "```json" in json_text:
-                try:
-                    json_text = json_text.split("```json")[1].split("```")[0].strip()
-                except IndexError:
-                    logger.debug("Failed to extract JSON from code block markers")
-            
-            # Attempt to parse the JSON string
-            try:
-                parsed_json = json.loads(json_text)
-                if isinstance(parsed_json, dict):
-                    # Validate and fix the structure
-                    return self._validate_and_fix_json_structure(parsed_json)
-                else:
-                    logger.warning(f"Parsed JSON is not a dict: {type(parsed_json)}")
-            except json.JSONDecodeError as e:
-                logger.debug(f"Failed to parse as JSON: {e}. Text: {json_text[:200]}")
-            except Exception as e:
-                logger.warning(f"Unexpected error parsing JSON: {e}")
-            
-            # If both fail, return empty structure
-            logger.debug(f"Could not parse output in any known format: {cleaned_text[:200]}")
-            return {
-                'detections': [],
-                'keypoints': [],
-                'polygons': [],
-                'classifications': [],
-                'text_detections': [],
-                'text_polygons': []
-            }
+        return self._parse_xml_output(cleaned_text) if has_xml_tags else self._parse_json_output(cleaned_text)
 
     def _to_detections(self, boxes: List[Dict], is_ocr: bool = False) -> fo.Detections:
         """Convert bounding boxes to FiftyOne Detections.
