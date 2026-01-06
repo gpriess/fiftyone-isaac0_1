@@ -16,7 +16,7 @@ from transformers.utils.import_utils import is_flash_attn_2_available
 from .modular_isaac import IsaacProcessor
 
 # Perceptron SDK imports for parsing
-from perceptron import extract_points, strip_tags, extract_reasoning, BoundingBox, SinglePoint, Polygon
+from perceptron import extract_points, strip_tags, extract_reasoning
 
 # Local converters for Perceptron -> FiftyOne types
 from .converters import (
@@ -295,8 +295,9 @@ class IsaacModel(SamplesMixin, Model):
         Returns:
             List of classification dictionaries with 'label' keys
         """
-        # Strip any geometry tags first
-        cleaned_text = strip_tags(output_text).strip()
+        # Remove think blocks first, then strip geometry tags
+        text_without_think = extract_reasoning(output_text).text
+        cleaned_text = strip_tags(text_without_think).strip()
 
         # Extract JSON from markdown code block if present
         if "```json" in cleaned_text:

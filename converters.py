@@ -7,9 +7,12 @@ Keypoint, Polyline).
 Both systems use a 0-1000 normalized coordinate system, but FiftyOne requires
 coordinates normalized to [0, 1].
 """
+import logging
 import fiftyone as fo
 from typing import List, Optional
 from perceptron import BoundingBox, SinglePoint, Polygon, pt
+
+logger = logging.getLogger(__name__)
 
 # Perceptron normalized coordinate max
 COORD_MAX = 1000.0
@@ -116,9 +119,16 @@ def perceptron_to_fiftyone_detections(
     """
     if not boxes:
         return fo.Detections(detections=[])
-    return fo.Detections(
-        detections=[perceptron_to_fiftyone_detection(b, is_ocr) for b in boxes]
-    )
+
+    detections = []
+    for b in boxes:
+        try:
+            detections.append(perceptron_to_fiftyone_detection(b, is_ocr))
+        except Exception as e:
+            logger.debug(f"Error processing box {b}: {e}")
+            continue
+
+    return fo.Detections(detections=detections)
 
 
 def perceptron_to_fiftyone_keypoints(points: List[SinglePoint]) -> fo.Keypoints:
@@ -138,10 +148,14 @@ def perceptron_to_fiftyone_keypoints(points: List[SinglePoint]) -> fo.Keypoints:
     # Group points by label
     by_label = {}
     for p in points:
-        label = p.mention or "point"
-        if label not in by_label:
-            by_label[label] = []
-        by_label[label].append(perceptron_to_fiftyone_keypoint(p))
+        try:
+            label = p.mention or "point"
+            if label not in by_label:
+                by_label[label] = []
+            by_label[label].append(perceptron_to_fiftyone_keypoint(p))
+        except Exception as e:
+            logger.debug(f"Error processing point {p}: {e}")
+            continue
 
     return fo.Keypoints(
         keypoints=[fo.Keypoint(label=k, points=v) for k, v in by_label.items()]
@@ -162,6 +176,16 @@ def perceptron_to_fiftyone_polylines(
     """
     if not polygons:
         return fo.Polylines(polylines=[])
-    return fo.Polylines(
-        polylines=[perceptron_to_fiftyone_polyline(p, is_ocr) for p in polygons]
-    )
+
+    polylines = []
+    for p in polygons:
+        try:
+            # Skip polygons with fewer than 3 vertices
+            if not p.hull or len(p.hull) < 3:
+                continue
+            polylines.append(perceptron_to_fiftyone_polyline(p, is_ocr))
+        except Exception as e:
+            logger.debug(f"Error processing polygon {p}: {e}")
+            continue
+
+    return fo.Polylines(polylines=polylines)
