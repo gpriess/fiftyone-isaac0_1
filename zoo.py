@@ -1,7 +1,6 @@
 import os
 import logging
 import json
-import re
 from PIL import Image
 from typing import Dict, Any, List, Union, Optional
 
@@ -15,6 +14,17 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from transformers.utils.import_utils import is_flash_attn_2_available
 
 from .modular_isaac import IsaacProcessor
+
+# Perceptron SDK imports for parsing
+from perceptron import extract_points, strip_tags, extract_reasoning, BoundingBox, SinglePoint, Polygon
+
+# Local converters for Perceptron -> FiftyOne types
+from .converters import (
+    perceptron_to_fiftyone_detections,
+    perceptron_to_fiftyone_keypoints,
+    perceptron_to_fiftyone_polylines,
+    box_to_center_point
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,499 +256,6 @@ class IsaacModel(SamplesMixin, Model):
     def system_prompt(self, value):
         self._custom_system_prompt = value
 
-    def _strip_think_blocks(self, text: str) -> str:
-        """Remove <think>...</think> blocks from text."""
-        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-
-    def _parse_coordinates(self, coord_str: str) -> Optional[List[float]]:
-        """Extract coordinates using parentheses pattern, falling back to all numbers.
-        
-        Args:
-            coord_str: String containing coordinate pairs
-            
-        Returns:
-            List of floats, or None if no valid coordinates found
-        """
-        # Try parentheses format: (x,y)
-        coord_pattern = r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)'
-        matches = re.findall(coord_pattern, coord_str)
-        
-        if matches:
-            return [float(val) for pair in matches for val in pair]
-        
-        # Fallback: extract all numbers
-        numbers = re.findall(r'-?\d+(?:\.\d+)?', coord_str)
-        return [float(n) for n in numbers] if len(numbers) >= 2 else None
-
-    def _extract_point_boxes(self, text: str) -> List[Dict]:
-        """Extract all <point_box> elements from text."""
-        boxes = []
-        
-        # Pattern for point_box with optional mention attribute
-        pattern = r'<point_box(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</point_box>'
-        
-        unlabeled_count = 0
-        for match in re.finditer(pattern, text, flags=re.DOTALL):
-            mention = match.group(1)
-            coords_text = match.group(2)
-            
-            coords = self._parse_coordinates(coords_text)
-            if coords and len(coords) >= 4:
-                # Generate unique label for unlabeled detections
-                if mention:
-                    label = mention
-                else:
-                    unlabeled_count += 1
-                    label = f'object_{unlabeled_count}'
-                
-                boxes.append({
-                    'bbox_2d': coords[:4],
-                    'label': label
-                })
-        
-        return boxes
-
-    def _extract_points(self, text: str) -> List[Dict]:
-        """Extract all <point> elements from text."""
-        points = []
-        
-        # Pattern for point with optional mention attribute
-        pattern = r'<point(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</point>'
-        
-        unlabeled_count = 0
-        for match in re.finditer(pattern, text, flags=re.DOTALL):
-            mention = match.group(1)
-            coords_text = match.group(2)
-            
-            coords = self._parse_coordinates(coords_text)
-            if coords and len(coords) >= 2:
-                # Generate unique label for unlabeled points
-                if mention:
-                    label = mention
-                else:
-                    unlabeled_count += 1
-                    label = f'point_{unlabeled_count}'
-                
-                points.append({
-                    'point_2d': coords[:2],
-                    'label': label
-                })
-        
-        return points
-
-    def _extract_polygons(self, text: str) -> List[Dict]:
-        """Extract all <polygon> elements from text. Parse everything, drop nothing."""
-        pattern = r'<polygon(?:\s+mention="([^"]*)")?\s*>\s*(.*?)\s*</polygon>'
-        polygons = []
-        unlabeled_count = 0
-        
-        for match in re.finditer(pattern, text, flags=re.DOTALL):
-            mention, coords_text = match.groups()
-            coords = self._parse_coordinates(coords_text)
-            
-            if not coords:
-                logger.info(f"Polygon '{mention or 'unlabeled'}': no coordinates found in: {coords_text[:80]}")
-                continue
-            
-            # Handle odd coordinates by dropping last one
-            if len(coords) % 2 != 0:
-                logger.info(f"Polygon '{mention or 'unlabeled'}': odd coords ({len(coords)}), dropping last")
-                coords = coords[:-1]
-            
-            # Convert to vertices - accept ANY number of vertices (even 1 or 2)
-            vertices = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
-            
-            unlabeled_count += 1
-            polygons.append({
-                'vertices': vertices,
-                'label': mention or f'polygon_{unlabeled_count}'
-            })
-        
-        return polygons
-
-    def _extract_all_elements(self, text: str, element_type: str = None) -> List[Dict]:
-        """Extract all elements from text, both from collections and standalone, with proper inheritance."""
-        all_elements = []
-        
-        # Pattern for collection with optional mention attribute
-        collection_pattern = r'<collection(?:\s+mention="([^"]*)")?\s*>(.*?)</collection>'
-        
-        # First, process collections
-        for match in re.finditer(collection_pattern, text, flags=re.DOTALL):
-            collection_mention = match.group(1)
-            collection_content = match.group(2)
-            
-            # Extract elements from within the collection
-            if element_type == 'point_box' or element_type is None:
-                boxes = self._extract_point_boxes(collection_content)
-                for box in boxes:
-                    # Inherit collection mention if box has default label
-                    if box['label'].startswith('object_') and collection_mention:
-                        box['label'] = collection_mention
-                    all_elements.append({'bbox_2d': box['bbox_2d'], 'label': box['label']})
-            
-            if element_type == 'point' or element_type is None:
-                points = self._extract_points(collection_content)
-                for point in points:
-                    # Inherit collection mention if point has default label
-                    if point['label'].startswith('point_') and collection_mention:
-                        point['label'] = collection_mention
-                    all_elements.append({'point_2d': point['point_2d'], 'label': point['label']})
-            
-            if element_type == 'polygon' or element_type is None:
-                polygons = self._extract_polygons(collection_content)
-                for polygon in polygons:
-                    # Inherit collection mention if polygon has default label
-                    if polygon['label'].startswith('polygon_') and collection_mention:
-                        polygon['label'] = collection_mention
-                    all_elements.append({'vertices': polygon['vertices'], 'label': polygon['label']})
-        
-        # Remove collections from text to avoid double-processing
-        text_without_collections = re.sub(collection_pattern, '', text, flags=re.DOTALL)
-        
-        # Process standalone elements (not in collections)
-        if element_type == 'point_box' or element_type is None:
-            all_elements.extend(self._extract_point_boxes(text_without_collections))
-        if element_type == 'point' or element_type is None:
-            all_elements.extend(self._extract_points(text_without_collections))
-        if element_type == 'polygon' or element_type is None:
-            all_elements.extend(self._extract_polygons(text_without_collections))
-        
-        return all_elements
-
-    def _validate_and_fix_json_structure(self, parsed_json: Dict) -> Dict:
-        """Validate and fix JSON structure from model output.
-        
-        Ensures the parsed JSON has all required keys with properly formatted values.
-        Also validates the structure of nested elements.
-        
-        Args:
-            parsed_json: Dictionary parsed from model JSON output
-            
-        Returns:
-            Validated and fixed dictionary with all required keys and valid structure
-        """
-        # Ensure all expected keys exist as lists
-        required_keys = ['detections', 'keypoints', 'polygons', 'classifications', 
-                         'text_detections', 'text_polygons']
-        
-        for key in required_keys:
-            if key not in parsed_json:
-                parsed_json[key] = []
-            elif not isinstance(parsed_json[key], list):
-                logger.warning(f"Expected list for '{key}', got {type(parsed_json[key])}. Converting to empty list.")
-                parsed_json[key] = []
-        
-        # Validate detections structure
-        validated_detections = []
-        for det in parsed_json.get('detections', []):
-            if not isinstance(det, dict):
-                logger.warning(f"Invalid detection format (not a dict): {det}")
-                continue
-            
-            # Check for required bbox field (accept either bbox or bbox_2d)
-            if 'bbox' in det or 'bbox_2d' in det:
-                bbox = det.get('bbox', det.get('bbox_2d'))
-                # Validate bbox is a list of 4 numbers
-                if isinstance(bbox, list) and len(bbox) == 4:
-                    try:
-                        # Ensure all bbox values are numeric
-                        _ = [float(x) for x in bbox]
-                        validated_detections.append(det)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid bbox coordinates (not numeric): {bbox}")
-                else:
-                    logger.warning(f"Invalid bbox format (need 4 numbers): {bbox}")
-            else:
-                logger.warning(f"Detection missing bbox field: {det}")
-        
-        parsed_json['detections'] = validated_detections
-        parsed_json['text_detections'] = validated_detections.copy()
-        
-        # Validate keypoints structure
-        validated_keypoints = []
-        for kp in parsed_json.get('keypoints', []):
-            if not isinstance(kp, dict):
-                logger.warning(f"Invalid keypoint format (not a dict): {kp}")
-                continue
-            
-            # Check for required point field
-            if 'point_2d' in kp or 'point' in kp:
-                point = kp.get('point_2d', kp.get('point'))
-                # Validate point is a list of 2 numbers
-                if isinstance(point, list) and len(point) == 2:
-                    try:
-                        _ = [float(x) for x in point]
-                        validated_keypoints.append(kp)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid point coordinates (not numeric): {point}")
-                else:
-                    logger.warning(f"Invalid point format (need 2 numbers): {point}")
-            else:
-                logger.warning(f"Keypoint missing point field: {kp}")
-        
-        parsed_json['keypoints'] = validated_keypoints
-        
-        # Validate polygons structure - accept all valid coordinate pairs
-        validated_polygons = []
-        for poly in parsed_json.get('polygons', []):
-            if not isinstance(poly, dict) or 'vertices' not in poly:
-                continue
-            
-            vertices = poly['vertices']
-            if not isinstance(vertices, list):
-                logger.info(f"Polygon vertices is not a list: {type(vertices)}")
-                continue
-            
-            # Validate vertices are coordinate pairs, but accept ANY number (even 1 or 2)
-            try:
-                if all(isinstance(v, list) and len(v) == 2 for v in vertices):
-                    _ = [[float(x) for x in v] for v in vertices]  # Ensure numeric
-                    validated_polygons.append(poly)
-                else:
-                    logger.info(f"Polygon has invalid vertex format")
-            except (ValueError, TypeError):
-                logger.info(f"Polygon has non-numeric coordinates")
-        
-        parsed_json['polygons'] = validated_polygons
-        parsed_json['text_polygons'] = validated_polygons.copy()
-        
-        # Validate classifications structure
-        validated_classifications = []
-        for cls in parsed_json.get('classifications', []):
-            if not isinstance(cls, dict):
-                logger.warning(f"Invalid classification format (not a dict): {cls}")
-                continue
-            
-            # Check for required label field
-            if 'label' in cls:
-                # Ensure label is a string
-                if isinstance(cls['label'], str) or isinstance(cls['label'], (int, float)):
-                    cls['label'] = str(cls['label'])
-                    validated_classifications.append(cls)
-                else:
-                    logger.warning(f"Invalid label type: {type(cls['label'])}")
-            else:
-                logger.warning(f"Classification missing label field: {cls}")
-        
-        parsed_json['classifications'] = validated_classifications
-        
-        return parsed_json
-
-    def _parse_xml_output(self, text: str) -> Dict:
-        """Parse XML-like output format."""
-        result = {
-            'detections': [],
-            'keypoints': [],
-            'polygons': [],
-            'text_detections': [],
-            'text_polygons': [],
-            'classifications': []
-        }
-        
-        all_elements = self._extract_all_elements(text)
-        
-        for elem in all_elements:
-            if 'bbox_2d' in elem:
-                result['detections'].append(elem)
-                result['text_detections'].append(elem)
-            elif 'point_2d' in elem:
-                result['keypoints'].append(elem)
-            elif 'vertices' in elem:
-                result['polygons'].append(elem)
-                result['text_polygons'].append(elem)
-        
-        logger.info(f"XML: {len(result['polygons'])} polygons, {len(result['detections'])} detections, {len(result['keypoints'])} keypoints")
-        return result
-
-    def _parse_json_output(self, text: str) -> Dict:
-        """Parse JSON output format."""
-        # Extract JSON from markdown if needed
-        if "```json" in text:
-            try:
-                text = text.split("```json")[1].split("```")[0].strip()
-            except IndexError:
-                logger.warning("Failed to extract JSON from code block")
-        
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                validated = self._validate_and_fix_json_structure(parsed)
-                logger.info(f"JSON: {len(validated.get('polygons', []))} polygons, {len(validated.get('detections', []))} detections")
-                return validated
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON parse error: {e}")
-        except Exception as e:
-            logger.warning(f"Unexpected error: {e}")
-        
-        # Return empty structure if parsing fails
-        return {
-            'detections': [], 'keypoints': [], 'polygons': [],
-            'classifications': [], 'text_detections': [], 'text_polygons': []
-        }
-
-    def _parse_model_output(self, output_text: str) -> Dict:
-        """Parse model output (XML or JSON format) into standardized structure."""
-        cleaned_text = self._strip_think_blocks(output_text)
-        
-        # Log raw output for debugging
-        logger.info(f"Model output: {cleaned_text[:500]}{'...' if len(cleaned_text) > 500 else ''}")
-        
-        # Detect and parse format
-        has_xml_tags = any(tag in cleaned_text for tag in ['<point>', '<point_box>', '<polygon>', '<collection>'])
-        
-        return self._parse_xml_output(cleaned_text) if has_xml_tags else self._parse_json_output(cleaned_text)
-
-    def _to_detections(self, boxes: List[Dict], is_ocr: bool = False) -> fo.Detections:
-        """Convert bounding boxes to FiftyOne Detections.
-        
-        This method handles both regular object detections and OCR text detections.
-        
-        Args:
-            boxes: List of dictionaries containing bounding box info.
-                Each box should have:
-                - 'bbox_2d' or 'bbox': List of [x1,y1,x2,y2] coordinates in 0-1000 range
-                - 'label': String label. For OCR detections, this contains the detected text.
-            is_ocr: If True, treats label as OCR text and adds it as a custom attribute
-        
-        Returns:
-            fo.Detections object with normalized coordinates [0,1] x [0,1]
-        """
-        if not boxes:
-            return fo.Detections(detections=[])
-            
-        detections = []
-        
-        for box in boxes:
-            try:
-                # Try to get bbox from either bbox_2d or bbox field
-                bbox = box.get('bbox_2d', box.get('bbox', None))
-                if not bbox:
-                    continue
-                    
-                # Model outputs coordinates in 0-1000 range, normalize to 0-1
-                x1, y1, x2, y2 = map(float, bbox)
-                x = x1 / 1000.0
-                y = y1 / 1000.0
-                w = (x2 - x1) / 1000.0
-                h = (y2 - y1) / 1000.0
-                
-                label = str(box.get("label", "object"))
-                
-                # Create Detection object with normalized coordinates
-                detection = fo.Detection(
-                    label=label,
-                    bounding_box=[x, y, w, h],
-                )
-                
-                # For OCR mode, also store the text in a dedicated attribute
-                if is_ocr:
-                    detection["text"] = label
-                
-                detections.append(detection)
-                
-            except Exception as e:
-                logger.debug(f"Error processing box {box}: {e}")
-                continue
-                
-        return fo.Detections(detections=detections)
-
-    def _to_keypoints(self, points: List[Dict]) -> fo.Keypoints:
-        """Convert a list of point dictionaries to FiftyOne Keypoints.
-        
-        Args:
-            points: List of dictionaries containing point information.
-                Each point should have:
-                - 'point_2d': List of [x,y] coordinates in 0-1000 range
-                - 'label': String label describing the point
-                
-        Returns:
-            fo.Keypoints object with normalized coordinates [0,1] x [0,1]
-        """
-        if not points:
-            return fo.Keypoints(keypoints=[])
-            
-        keypoints = []
-        
-        for point in points:
-            try:
-                # Get coordinates from point_2d field and convert to float
-                x, y = point["point_2d"]
-                x = float(x)
-                y = float(y)
-                
-                # Model outputs coordinates in 0-1000 range, normalize to 0-1
-                normalized_point = [
-                    x / 1000.0,
-                    y / 1000.0
-                ]
-                
-                keypoint = fo.Keypoint(
-                    label=str(point.get("label", "point")),
-                    points=[normalized_point],
-                )
-                keypoints.append(keypoint)
-            except Exception as e:
-                logger.debug(f"Error processing point {point}: {e}")
-                continue
-                
-        return fo.Keypoints(keypoints=keypoints)
-
-    def _to_polygons(self, polygons: List[Dict], is_ocr: bool = False) -> fo.Polylines:
-        """Convert polygon data to FiftyOne Polylines.
-        
-        This method handles both regular polygon segmentations and OCR text polygons.
-        
-        Args:
-            polygons: List of dictionaries containing polygon information.
-                Each dictionary should have:
-                - 'vertices': List of [x,y] coordinate pairs in 0-1000 range
-                - 'label': String label. For OCR polygons, this contains the detected text.
-            is_ocr: If True, treats label as OCR text and adds it as a custom attribute
-                
-        Returns:
-            fo.Polylines object containing the polygon annotations
-        """
-        if not polygons:
-            return fo.Polylines(polylines=[])
-            
-        polylines = []
-        
-        for polygon in polygons:
-            try:
-                vertices = polygon.get('vertices', [])
-                if not vertices or len(vertices) < 3:
-                    continue
-                    
-                # Convert vertices from 0-1000 range to 0-1 normalized
-                normalized_points = []
-                for x, y in vertices:
-                    norm_x = float(x) / 1000.0
-                    norm_y = float(y) / 1000.0
-                    normalized_points.append([norm_x, norm_y])
-                
-                label = str(polygon.get('label', 'polygon'))
-                
-                # Create Polyline
-                polyline = fo.Polyline(
-                    label=label,
-                    points=[normalized_points],
-                    closed=True,
-                    filled=True
-                )
-                
-                # For OCR mode, also store the text in a dedicated attribute
-                if is_ocr:
-                    polyline["text"] = label
-                
-                polylines.append(polyline)
-                
-            except Exception as e:
-                logger.debug(f"Error processing polygon {polygon}: {e}")
-                continue
-                
-        return fo.Polylines(polylines=polylines)
-
     def _to_classifications(self, classes: List[Dict]) -> fo.Classifications:
         """Convert a list of classification dictionaries to FiftyOne Classifications.
         
@@ -767,68 +284,111 @@ class IsaacModel(SamplesMixin, Model):
                 
         return fo.Classifications(classifications=classifications)
 
+    def _parse_classification_output(self, output_text: str) -> List[Dict]:
+        """Parse classification output from JSON format.
+
+        Classifications use JSON output rather than XML tags.
+
+        Args:
+            output_text: Raw text output from the model
+
+        Returns:
+            List of classification dictionaries with 'label' keys
+        """
+        # Strip any geometry tags first
+        cleaned_text = strip_tags(output_text).strip()
+
+        # Extract JSON from markdown code block if present
+        if "```json" in cleaned_text:
+            try:
+                cleaned_text = cleaned_text.split("```json")[1].split("```")[0].strip()
+            except IndexError:
+                logger.warning("Failed to extract JSON from code block")
+
+        try:
+            parsed = json.loads(cleaned_text)
+            if isinstance(parsed, dict):
+                classifications = parsed.get('classifications', [])
+                # Validate and normalize classification entries
+                validated = []
+                for cls in classifications:
+                    if isinstance(cls, dict) and 'label' in cls:
+                        cls['label'] = str(cls['label'])
+                        validated.append(cls)
+                return validated
+            elif isinstance(parsed, list):
+                # Handle case where model returns a list directly
+                validated = []
+                for cls in parsed:
+                    if isinstance(cls, dict) and 'label' in cls:
+                        cls['label'] = str(cls['label'])
+                        validated.append(cls)
+                return validated
+        except json.JSONDecodeError as e:
+            logger.warning(f"Classification JSON parse error: {e}")
+        except Exception as e:
+            logger.warning(f"Classification parse error: {e}")
+
+        return []
+
     def _process_output(self, output_text: str, image: Image.Image):
         """Process model output text based on the current operation type.
-        
+
+        Uses Perceptron SDK for parsing XML-style tags and converts to FiftyOne types.
+
         Args:
             output_text: Raw text output from the model
             image: PIL Image that was processed
-            
+
         Returns:
             Processed output in the appropriate format for the operation
         """
         if self.operation == "vqa":
-            cleaned = self._strip_think_blocks(output_text)
-            return cleaned.strip()
-        
+            # Remove think blocks, then strip geometry tags
+            text_without_think = extract_reasoning(output_text).text
+            return strip_tags(text_without_think).strip()
+
         elif self.operation == "ocr":
-            cleaned = self._strip_think_blocks(output_text)
-            return cleaned.strip()
-        
+            # Remove think blocks, then strip geometry tags
+            text_without_think = extract_reasoning(output_text).text
+            return strip_tags(text_without_think).strip()
+
         elif self.operation == "detect":
-            parsed = self._parse_model_output(output_text)
-            data = parsed.get('detections', [])
-            return self._to_detections(data, is_ocr=False)
-        
+            # Extract bounding boxes using Perceptron SDK
+            boxes = extract_points(output_text, expected="box")
+            return perceptron_to_fiftyone_detections(boxes, is_ocr=False)
+
         elif self.operation == "point":
-            parsed = self._parse_model_output(output_text)
-            data = parsed.get('keypoints', [])
-            
-            # Special case: if model outputs point_boxes when asked for points,
-            # convert them to keypoints (use center of box)
-            if not data and parsed.get('detections'):
-                for detection in parsed['detections']:
-                    if 'bbox_2d' in detection:
-                        x1, y1, x2, y2 = detection['bbox_2d']
-                        center_x = (x1 + x2) / 2
-                        center_y = (y1 + y2) / 2
-                        data.append({
-                            'point_2d': [center_x, center_y],
-                            'label': detection.get('label', 'point')
-                        })
-            
-            return self._to_keypoints(data)
-        
+            # Extract points using Perceptron SDK
+            points = extract_points(output_text, expected="point")
+
+            # Fallback: if model returns boxes instead of points, use box centers
+            if not points:
+                boxes = extract_points(output_text, expected="box")
+                points = [box_to_center_point(b) for b in boxes]
+
+            return perceptron_to_fiftyone_keypoints(points)
+
         elif self.operation == "classify":
-            parsed = self._parse_model_output(output_text)
-            data = parsed.get('classifications', [])
-            return self._to_classifications(data)
-        
+            # Classification uses JSON output, keep existing parsing
+            parsed = self._parse_classification_output(output_text)
+            return self._to_classifications(parsed)
+
         elif self.operation == "ocr_detection":
-            parsed = self._parse_model_output(output_text)
-            data = parsed.get('text_detections', [])
-            return self._to_detections(data, is_ocr=True)
-        
+            # Extract bounding boxes with OCR text labels
+            boxes = extract_points(output_text, expected="box")
+            return perceptron_to_fiftyone_detections(boxes, is_ocr=True)
+
         elif self.operation == "ocr_polygon":
-            parsed = self._parse_model_output(output_text)
-            data = parsed.get('text_polygons', [])
-            return self._to_polygons(data, is_ocr=True)
-        
+            # Extract polygons with OCR text labels
+            polygons = extract_points(output_text, expected="polygon")
+            return perceptron_to_fiftyone_polylines(polygons, is_ocr=True)
+
         elif self.operation == "polygon" or self.operation == "segment":
-            parsed = self._parse_model_output(output_text)
-            data = parsed.get('polygons', [])
-            return self._to_polygons(data, is_ocr=False)
-        
+            # Extract polygons using Perceptron SDK
+            polygons = extract_points(output_text, expected="polygon")
+            return perceptron_to_fiftyone_polylines(polygons, is_ocr=False)
+
         else:
             return None
 
