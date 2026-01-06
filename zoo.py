@@ -10,10 +10,8 @@ import torch
 import fiftyone as fo
 from fiftyone import Model, SamplesMixin
 
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoConfig, AutoProcessor, AutoModelForCausalLM
 from transformers.utils.import_utils import is_flash_attn_2_available
-
-from .modular_isaac import IsaacProcessor
 
 # Perceptron SDK imports for parsing
 from perceptron import extract_points, strip_tags, extract_reasoning
@@ -204,10 +202,7 @@ class IsaacModel(SamplesMixin, Model):
 
         logger.info("Loading processor")
 
-        self.processor = IsaacProcessor(
-            tokenizer=self.tokenizer,
-            config=self.config
-        )
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
     @property
     def needs_fields(self):
