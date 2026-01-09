@@ -228,6 +228,6 @@ If you use Isaac-0.1 in your research or applications, please cite:
 
 ## Acknowledgments
 
-- [Perceptron AI](https://perceptron.ai) for developing Isaac-0.1
+- [Perceptron AI](https://perceptron.inc) for developing Isaac-0.1
 
 - [FiftyOne](https://voxel51.com/fiftyone) by Voxel51 for the model zoo framework
